@@ -90,6 +90,19 @@ plan/
 - All subgraphs share the same `AgentState` — no separate state classes per subgraph unless strictly needed.
 - Never mutate state objects — use `.model_copy(update={...})`.
 
+**Identity fields in `AgentState`** (populated by `context_loader` from memory on session start):
+
+| Field | Type | Source | Purpose |
+|---|---|---|---|
+| `user_id` | `str` | caller / `AgentInput` | Memory namespace key, Supabase filter |
+| `session_id` | `str` | caller or auto-generated | Thread ID for checkpointer |
+| `user_name` | `str` | `user_profile` memory | Personalised greetings and report headings |
+| `user_role` | `str` | `user_profile` memory | Context for planner and prompts |
+| `company_name` | `str` | `company_profile` memory | Report metadata, Supabase record |
+
+`user_name`, `user_role`, `company_name` default to `""` until `context_loader` populates them.
+`AgentInput` accepts optional hints for all three so the caller can seed them on first session.
+
 ### 3. Memory Namespaces
 
 | Namespace | Key | Purpose |
@@ -132,6 +145,232 @@ Each interrupt uses the Agent Inbox schema: `{action_request, config, descriptio
 ### 8. Report Storage
 - On approval, the report is stored in Supabase with metadata tags: `user_id`, `session_id`, `date`, `topic`, `format`.
 - The report is also chunked and embedded back into the company database for future RAG retrieval.
+
+---
+
+## Database Schema
+
+> All tables live in the Supabase project. The `chunks` and `documents` tables already exist.
+> Run the SQL blocks below in the **Supabase SQL editor** to create the missing tables and functions.
+> The LangGraph checkpointer tables are created automatically — see section 4.
+
+---
+
+### 1. Existing Tables (already in Supabase — do not recreate)
+
+#### `documents`
+Holds the parent document record for each ingested file.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | uuid PK | auto-generated |
+| `title` | text | document title |
+| `source_type` | text | e.g. `"pdf"`, `"url"`, `"notion"` |
+| `source_path` | text | file path or URL |
+| `file_type` | text | MIME or extension |
+| `total_pages` | int4 | page count |
+| `total_chunks` | int4 | chunk count produced |
+| `metadata` | jsonb | arbitrary extra metadata |
+| `created_at` | timestamptz | auto |
+| `updated_at` | timestamptz | auto |
+
+#### `chunks`
+Holds individual text chunks with embeddings for vector search.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | uuid PK | auto-generated |
+| `document_id` | uuid FK → documents.id | parent document |
+| `content` | text | chunk text |
+| `embedding` | vector(1024) | Voyage-3 embedding |
+| `chunk_index` | int4 | position within document |
+| `page_number` | int4 | source page (nullable) |
+| `heading` | text | section heading (nullable) |
+| `subheading` | text | subsection heading (nullable) |
+| `section_path` | text[] | breadcrumb path of headings |
+| `chunk_type` | text | e.g. `"paragraph"`, `"table"`, `"heading"` |
+| `keywords` | text[] | extracted keywords |
+| `questions` | jsonb | list of questions this chunk answers |
+| `summary` | text | one-line chunk summary |
+| `tsv` | tsvector | full-text search index |
+| `created_at` | timestamptz | auto |
+
+---
+
+### 2. Tables to Create — Run in Supabase SQL Editor
+
+#### `reports`
+Stores completed, user-approved strategic reports.
+
+```sql
+CREATE TABLE IF NOT EXISTS reports (
+    id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id         text NOT NULL,
+    session_id      text NOT NULL,
+    title           text NOT NULL,
+    topic_tags      text[] NOT NULL DEFAULT '{}',
+    project_name    text NOT NULL DEFAULT '',
+    executive_summary text NOT NULL DEFAULT '',
+    frameworks_used text[] NOT NULL DEFAULT '{}',
+    content         text NOT NULL,               -- full report markdown
+    format          text NOT NULL DEFAULT 'markdown', -- markdown | json | pdf
+    metadata        jsonb NOT NULL DEFAULT '{}', -- arbitrary extra tags
+    created_at      timestamptz NOT NULL DEFAULT now()
+);
+
+-- Index for fast per-user lookups
+CREATE INDEX IF NOT EXISTS reports_user_id_idx ON reports (user_id);
+CREATE INDEX IF NOT EXISTS reports_session_id_idx ON reports (session_id);
+CREATE INDEX IF NOT EXISTS reports_created_at_idx ON reports (created_at DESC);
+
+-- GIN index for topic tag filtering
+CREATE INDEX IF NOT EXISTS reports_topic_tags_idx ON reports USING GIN (topic_tags);
+```
+
+#### `report_chunks`
+Chunks of approved reports re-embedded for future RAG retrieval.
+Uses the **same embedding model and dimension** as `chunks` (Voyage-3, 1024).
+
+```sql
+CREATE TABLE IF NOT EXISTS report_chunks (
+    id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    report_id       uuid NOT NULL REFERENCES reports (id) ON DELETE CASCADE,
+    user_id         text NOT NULL,               -- denormalised for fast filter
+    content         text NOT NULL,
+    embedding       vector(1024),                -- Voyage-3, must match chunks table
+    chunk_index     int4 NOT NULL,
+    heading         text,
+    keywords        text[] NOT NULL DEFAULT '{}',
+    created_at      timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS report_chunks_report_id_idx ON report_chunks (report_id);
+CREATE INDEX IF NOT EXISTS report_chunks_user_id_idx ON report_chunks (user_id);
+
+-- HNSW vector index — same params as chunks table
+CREATE INDEX IF NOT EXISTS report_chunks_embedding_idx
+    ON report_chunks USING hnsw (embedding vector_cosine_ops);
+```
+
+---
+
+### 3. Required RPC Functions — Run in Supabase SQL Editor
+
+#### `match_documents` (company knowledge base search)
+Called by `rag_tool.py`. Name must match `SUPABASE_MATCH_FUNCTION` env var.
+
+```sql
+CREATE OR REPLACE FUNCTION match_documents(
+    query_embedding vector(1024),
+    match_count     int DEFAULT 8,
+    filter          jsonb DEFAULT '{}'
+)
+RETURNS TABLE (
+    id          uuid,
+    document_id uuid,
+    content     text,
+    heading     text,
+    subheading  text,
+    section_path text[],
+    chunk_type  text,
+    keywords    text[],
+    summary     text,
+    page_number int4,
+    chunk_index int4,
+    metadata    jsonb,
+    similarity  float
+)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RETURN QUERY
+    SELECT
+        c.id,
+        c.document_id,
+        c.content,
+        c.heading,
+        c.subheading,
+        c.section_path,
+        c.chunk_type,
+        c.keywords,
+        c.summary,
+        c.page_number,
+        c.chunk_index,
+        d.metadata,
+        1 - (c.embedding <=> query_embedding) AS similarity
+    FROM chunks c
+    JOIN documents d ON d.id = c.document_id
+    WHERE
+        CASE
+            WHEN filter != '{}' THEN d.metadata @> filter
+            ELSE TRUE
+        END
+    ORDER BY c.embedding <=> query_embedding
+    LIMIT match_count;
+END;
+$$;
+```
+
+#### `match_report_chunks` (past reports search)
+Called when agent retrieves from previously approved reports.
+
+```sql
+CREATE OR REPLACE FUNCTION match_report_chunks(
+    query_embedding vector(1024),
+    target_user_id  text,
+    match_count     int DEFAULT 5
+)
+RETURNS TABLE (
+    id          uuid,
+    report_id   uuid,
+    content     text,
+    heading     text,
+    keywords    text[],
+    chunk_index int4,
+    similarity  float
+)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RETURN QUERY
+    SELECT
+        rc.id,
+        rc.report_id,
+        rc.content,
+        rc.heading,
+        rc.keywords,
+        rc.chunk_index,
+        1 - (rc.embedding <=> query_embedding) AS similarity
+    FROM report_chunks rc
+    WHERE rc.user_id = target_user_id
+    ORDER BY rc.embedding <=> query_embedding
+    LIMIT match_count;
+END;
+$$;
+```
+
+---
+
+### 4. LangGraph Prod Checkpointer Tables (DO NOT create manually)
+
+These are created automatically when you call `PostgresSaver.setup()` or
+`AsyncPostgresSaver.setup()` using the `SUPABASE_DB_URL` connection string.
+**Reference only — never create these by hand.**
+
+```
+checkpoints          → stores serialised graph state per (thread_id, checkpoint_ns, checkpoint_id)
+checkpoint_blobs     → large blob data per channel/version
+checkpoint_writes    → pending buffered writes per task
+checkpoint_migrations → schema version tracking
+```
+
+In production `main_graph.py` init:
+```python
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+async with AsyncPostgresSaver.from_conn_string(os.getenv("SUPABASE_DB_URL")) as checkpointer:
+    await checkpointer.setup()   # creates all four tables if they don't exist
+    graph = builder.compile(checkpointer=checkpointer, store=store)
+```
 
 ---
 

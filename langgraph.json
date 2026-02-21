@@ -1,0 +1,9 @@
+{
+    "dockerfile_lines": [],
+    "graphs": {
+        "strategic_analyst": "./src/strategic_analyst/main_graph.py:graph"
+    },
+    "python_version": "3.12",
+    "env": ".env",
+    "dependencies": ["."]
+}

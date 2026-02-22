@@ -14,8 +14,9 @@
 | Concern | Choice |
 |---|---|
 | Agent framework | LangGraph (`langgraph>=0.2`) |
-| LLM | Claude (claude-sonnet-4-6 primary, claude-haiku-4-5 for cheap utility calls) |
-| LLM SDK | `langchain-anthropic` |
+| LLM | OVH AI Endpoints — `Mistral-Nemo-Instruct-2407` (primary/utility), `gpt-oss-20b` (long-context, 131 k token window) |
+| LLM SDK | `langchain-openai` (`ChatOpenAI` with OVH `base_url`) |
+| Embeddings | BGE-M3 via OVH AI Endpoint (`https://bge-m3.endpoints.kepler.ai.cloud.ovh.net/api/text2vec`, 1024 dims) — same token as LLM (`OVH_KEY`) |
 | Vector DB / Company DB | Supabase (pgvector) |
 | Web Search | Tavily (`langchain-community` TavilySearch) |
 | Memory persistence | LangGraph `BaseStore` (`InMemoryStore` for dev, Supabase-backed for prod) |
@@ -45,7 +46,7 @@ src/
       report_saver.py      ← store final report to Supabase
     tools/
       base.py              ← get_tools(), get_tools_by_name() registry
-      rag_tool.py          ← Supabase pgvector retrieval
+      rag_tool.py          ← semantic_search + hybrid_search (BGE-M3 + Supabase pgvector)
       web_search_tool.py   ← Tavily wrapper
       memory_tools.py      ← memory_search_tool, write_memory_tool
       question_tool.py     ← Question, Done signal tools
@@ -113,7 +114,7 @@ plan/
 | `("strategic_analyst", user_id, "episodic_memory")` | `"episodes"` | Important dates, temporal notes per session |
 
 - All memory reads inject content into system prompts at runtime.
-- All memory writes use an LLM (haiku) with targeted-update prompt — **never overwrite the whole profile**.
+- All memory writes use an LLM (`Mistral-Nemo-Instruct-2407`) with targeted-update prompt — **never overwrite the whole profile**.
 
 ### 4. HITL Gates
 Three mandatory interrupt points:
@@ -125,14 +126,17 @@ Each interrupt uses the Agent Inbox schema: `{action_request, config, descriptio
 
 ### 5. Tools Per Agent
 
+The agent LLM decides which search tool to call (and can issue multiple queries per turn).
+Default to `hybrid_search`; use `semantic_search` only for broad conceptual queries.
+
 | Agent | Tools |
 |---|---|
-| Main orchestrator / context loader | `rag_tool`, `memory_search_tool` |
-| Planner | `rag_tool`, `memory_search_tool` |
-| Research Supervisor | `rag_tool`, `web_search_tool`, `memory_search_tool`, `write_memory_tool`, `Question` |
-| Research Task Agents | `rag_tool`, `web_search_tool` |
+| Main orchestrator / context loader | `semantic_search`, `hybrid_search`, `memory_search_tool` |
+| Planner | `semantic_search`, `hybrid_search`, `memory_search_tool` |
+| Research Supervisor | `semantic_search`, `hybrid_search`, `web_search_tool`, `memory_search_tool`, `write_memory_tool`, `Question` |
+| Research Task Agents | `semantic_search`, `hybrid_search`, `web_search_tool`, `Done` |
 | Report Supervisor | `memory_search_tool`, `write_memory_tool`, `Question` |
-| Report Writer Agent | `rag_tool`, `memory_search_tool` |
+| Report Writer Agent | `semantic_search`, `hybrid_search`, `memory_search_tool`, `Done` |
 
 ### 6. Routing
 - Use `Command(goto=, update=)` for nodes that both update state and choose destination.
@@ -182,18 +186,16 @@ Holds individual text chunks with embeddings for vector search.
 | `id` | uuid PK | auto-generated |
 | `document_id` | uuid FK → documents.id | parent document |
 | `content` | text | chunk text |
-| `embedding` | vector(1024) | Voyage-3 embedding |
-| `chunk_index` | int4 | position within document |
+| `embedding` | vector(1024) | BGE-M3 embedding (`BAAI/bge-m3`) |
 | `page_number` | int4 | source page (nullable) |
 | `heading` | text | section heading (nullable) |
 | `subheading` | text | subsection heading (nullable) |
 | `section_path` | text[] | breadcrumb path of headings |
-| `chunk_type` | text | e.g. `"paragraph"`, `"table"`, `"heading"` |
-| `keywords` | text[] | extracted keywords |
-| `questions` | jsonb | list of questions this chunk answers |
-| `summary` | text | one-line chunk summary |
-| `tsv` | tsvector | full-text search index |
+| `chunk_type` | text | e.g. `"text"`, `"table"`, `"code"`, `"list"` |
+| `tsv` | tsvector | weighted FTS index (heading A, content C) — used by `hybrid_search` |
 | `created_at` | timestamptz | auto |
+
+> **Not populated in this implementation:** `keywords`, `questions`, `summary` columns may exist in the table definition but are not written during ingestion and must not be referenced in queries or prompts.
 
 ---
 
@@ -229,7 +231,7 @@ CREATE INDEX IF NOT EXISTS reports_topic_tags_idx ON reports USING GIN (topic_ta
 
 #### `report_chunks`
 Chunks of approved reports re-embedded for future RAG retrieval.
-Uses the **same embedding model and dimension** as `chunks` (Voyage-3, 1024).
+Uses the **same embedding model and dimension** as `chunks` (BGE-M3, 1024 dims).
 
 ```sql
 CREATE TABLE IF NOT EXISTS report_chunks (
@@ -237,10 +239,9 @@ CREATE TABLE IF NOT EXISTS report_chunks (
     report_id       uuid NOT NULL REFERENCES reports (id) ON DELETE CASCADE,
     user_id         text NOT NULL,               -- denormalised for fast filter
     content         text NOT NULL,
-    embedding       vector(1024),                -- Voyage-3, must match chunks table
+    embedding       vector(1024),                -- BGE-M3, must match chunks table
     chunk_index     int4 NOT NULL,
     heading         text,
-    keywords        text[] NOT NULL DEFAULT '{}',
     created_at      timestamptz NOT NULL DEFAULT now()
 );
 
@@ -256,56 +257,100 @@ CREATE INDEX IF NOT EXISTS report_chunks_embedding_idx
 
 ### 3. Required RPC Functions — Run in Supabase SQL Editor
 
-#### `match_documents` (company knowledge base search)
-Called by `rag_tool.py`. Name must match `SUPABASE_MATCH_FUNCTION` env var.
+#### `semantic_search` — pure vector similarity
+Called by `rag_tool.py::semantic_search`. Best for broad conceptual queries.
 
 ```sql
-CREATE OR REPLACE FUNCTION match_documents(
+CREATE OR REPLACE FUNCTION semantic_search(
     query_embedding vector(1024),
-    match_count     int DEFAULT 8,
-    filter          jsonb DEFAULT '{}'
+    match_count     int DEFAULT 10
 )
 RETURNS TABLE (
-    id          uuid,
-    document_id uuid,
-    content     text,
-    heading     text,
-    subheading  text,
-    section_path text[],
-    chunk_type  text,
-    keywords    text[],
-    summary     text,
-    page_number int4,
-    chunk_index int4,
-    metadata    jsonb,
-    similarity  float
+    content        text,
+    heading        text,
+    page_number    int4,
+    document_title text,
+    source_path    text,
+    score          float
 )
 LANGUAGE plpgsql
 AS $$
 BEGIN
     RETURN QUERY
     SELECT
-        c.id,
-        c.document_id,
         c.content,
         c.heading,
-        c.subheading,
-        c.section_path,
-        c.chunk_type,
-        c.keywords,
-        c.summary,
         c.page_number,
-        c.chunk_index,
-        d.metadata,
-        1 - (c.embedding <=> query_embedding) AS similarity
+        d.title        AS document_title,
+        d.source_path,
+        1 - (c.embedding <=> query_embedding) AS score
     FROM chunks c
     JOIN documents d ON d.id = c.document_id
-    WHERE
-        CASE
-            WHEN filter != '{}' THEN d.metadata @> filter
-            ELSE TRUE
-        END
     ORDER BY c.embedding <=> query_embedding
+    LIMIT match_count;
+END;
+$$;
+```
+
+#### `hybrid_search` — RRF fusion of vector + BM25 full-text search
+Called by `rag_tool.py::hybrid_search`. **Default search** for most queries — especially
+specific terms, names, metrics, and financial figures.
+
+```sql
+CREATE OR REPLACE FUNCTION hybrid_search(
+    query_embedding vector(1024),
+    query_text      text,
+    match_count     int DEFAULT 10,
+    rrf_k           int DEFAULT 60
+)
+RETURNS TABLE (
+    content        text,
+    heading        text,
+    page_number    int4,
+    document_title text,
+    source_path    text,
+    score          float
+)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RETURN QUERY
+    WITH vector_ranked AS (
+        SELECT
+            c.id,
+            ROW_NUMBER() OVER (ORDER BY c.embedding <=> query_embedding) AS rank
+        FROM chunks c
+        LIMIT match_count * 2
+    ),
+    fts_ranked AS (
+        SELECT
+            c.id,
+            ROW_NUMBER() OVER (
+                ORDER BY ts_rank_cd(c.tsv, websearch_to_tsquery('english', query_text)) DESC
+            ) AS rank
+        FROM chunks c
+        WHERE c.tsv @@ websearch_to_tsquery('english', query_text)
+        LIMIT match_count * 2
+    ),
+    combined AS (
+        SELECT
+            COALESCE(v.id, f.id) AS chunk_id,
+            COALESCE(1.0 / (rrf_k + v.rank), 0.0) +
+            COALESCE(1.0 / (rrf_k + f.rank), 0.0) AS rrf_score
+        FROM vector_ranked v
+        FULL OUTER JOIN fts_ranked f ON v.id = f.id
+    )
+    SELECT
+        c.content,
+        c.heading,
+        c.page_number,
+        d.title        AS document_title,
+        d.source_path,
+        combined.rrf_score AS score
+    FROM combined
+    JOIN chunks c    ON c.id = combined.chunk_id
+    JOIN documents d ON d.id = c.document_id
+    ORDER BY combined.rrf_score DESC
     LIMIT match_count;
 END;
 $$;
@@ -325,7 +370,6 @@ RETURNS TABLE (
     report_id   uuid,
     content     text,
     heading     text,
-    keywords    text[],
     chunk_index int4,
     similarity  float
 )
@@ -338,7 +382,6 @@ BEGIN
         rc.report_id,
         rc.content,
         rc.heading,
-        rc.keywords,
         rc.chunk_index,
         1 - (rc.embedding <=> query_embedding) AS similarity
     FROM report_chunks rc
@@ -388,7 +431,12 @@ async with AsyncPostgresSaver.from_conn_string(os.getenv("SUPABASE_DB_URL")) as 
 ## Environment Variables
 
 See `.env.example` for the full list. Required at minimum:
-- `ANTHROPIC_API_KEY`
+- `OVH_KEY` — single auth token for all OVH calls (LLM + embeddings)
+- `OVH_API_BASE_URL` — `https://oai.endpoints.kepler.ai.cloud.ovh.net/v1`
+- `OVH_EMBEDDING_ENDPOINT_URL` — `https://bge-m3.endpoints.kepler.ai.cloud.ovh.net/api/text2vec`
+- `MAIN_AGENT_MODEL` — `Mistral-Nemo-Instruct-2407`
+- `UTILITY_MODEL` — `Mistral-Nemo-Instruct-2407`
+- `LONG_CONTEXT_MODEL` — `gpt-oss-20b`
 - `SUPABASE_URL`, `SUPABASE_SERVICE_KEY`, `SUPABASE_DB_URL`
 - `TAVILY_API_KEY`
 - `LANGSMITH_API_KEY` (for tracing)
@@ -424,6 +472,8 @@ uv run python -m strategic_analyst
 - Do not put prompts inline in node functions.
 - Do not compile subgraphs with checkpointer or store.
 - Do not mutate state objects in place.
-- Do not use `gpt-*` models — this project uses Claude exclusively.
+- Do not use `langchain-anthropic` or any Anthropic SDK — all LLM calls use `ChatOpenAI` pointed at OVH.
 - Do not use `tool_choice="any"` where `tool_choice="required"` is appropriate.
 - Do not skip memory writes after HITL interactions — every feedback loop is a learning opportunity.
+- Do not reference `keywords`, `questions`, or `summary` chunk columns — they are not populated.
+- Do not use `semantic_search` as the default — always prefer `hybrid_search` unless the query is purely conceptual.

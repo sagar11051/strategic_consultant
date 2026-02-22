@@ -18,7 +18,7 @@ import os
 from typing import Tuple
 
 from langgraph.store.base import BaseStore
-from langchain_anthropic import ChatAnthropic
+from langchain_openai import ChatOpenAI
 
 from strategic_analyst.schemas import MemoryUpdate
 from strategic_analyst.prompts import (
@@ -142,10 +142,10 @@ def update_memory_with_llm(
     key: str,
     context_messages: list,
     update_reason: str,
-    model_name: str = "claude-haiku-4-5-20251001",
+    model_name: str = "Mistral-Nemo-Instruct-2407",
 ) -> None:
     """
-    Use Claude Haiku to make a targeted update to a memory namespace.
+    Use an OVH-hosted LLM to make a targeted update to a memory namespace.
     Never overwrites blindly — the LLM integrates new info while
     preserving all existing accurate content.
 
@@ -155,13 +155,15 @@ def update_memory_with_llm(
         key:              the key within the namespace
         context_messages: list of LangChain message dicts providing context
         update_reason:    human-readable reason this memory is being updated
-        model_name:       Claude model to use (default: Haiku for cost efficiency)
+        model_name:       model to use (default: Mistral-Nemo via OVH)
     """
     current_content = get_memory(store, namespace, key)
 
-    llm = ChatAnthropic(
-        model=model_name,
-        api_key=os.getenv("ANTHROPIC_API_KEY"),
+    llm = ChatOpenAI(
+        model=os.getenv("UTILITY_MODEL", model_name),
+        api_key=os.getenv("OVH_KEY") or os.getenv("OVH_AI_ENDPOINTS_ACCESS_TOKEN"),
+        base_url=os.getenv("OVH_API_BASE_URL", "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1"),
+        temperature=0.0,
     ).with_structured_output(MemoryUpdate)
 
     result: MemoryUpdate = llm.invoke(
@@ -187,7 +189,7 @@ async def update_memory_with_llm_async(
     key: str,
     context_messages: list,
     update_reason: str,
-    model_name: str = "claude-haiku-4-5-20251001",
+    model_name: str = "Mistral-Nemo-Instruct-2407",
 ) -> None:
     """
     Async version of update_memory_with_llm for use inside async node functions.
@@ -195,9 +197,11 @@ async def update_memory_with_llm_async(
     """
     current_content = get_memory(store, namespace, key)
 
-    llm = ChatAnthropic(
-        model=model_name,
-        api_key=os.getenv("ANTHROPIC_API_KEY"),
+    llm = ChatOpenAI(
+        model=os.getenv("UTILITY_MODEL", model_name),
+        api_key=os.getenv("OVH_KEY") or os.getenv("OVH_AI_ENDPOINTS_ACCESS_TOKEN"),
+        base_url=os.getenv("OVH_API_BASE_URL", "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1"),
+        temperature=0.0,
     ).with_structured_output(MemoryUpdate)
 
     result: MemoryUpdate = await llm.ainvoke(

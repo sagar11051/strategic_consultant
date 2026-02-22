@@ -331,8 +331,8 @@ BEGIN
     combined AS (
         SELECT
             COALESCE(v.id, f.id) AS chunk_id,
-            COALESCE(1.0 / (rrf_k + v.rank), 0.0) +
-            COALESCE(1.0 / (rrf_k + f.rank), 0.0) AS rrf_score
+            COALESCE(1.0::float8 / (rrf_k + v.rank), 0.0::float8) +
+            COALESCE(1.0::float8 / (rrf_k + f.rank), 0.0::float8) AS rrf_score
         FROM vector_ranked v
         FULL OUTER JOIN fts_ranked f ON v.id = f.id
     )
@@ -342,7 +342,7 @@ BEGIN
         c.page_number,
         d.title        AS document_title,
         d.source_path,
-        combined.rrf_score AS score
+        combined.rrf_score::float AS score
     FROM combined
     JOIN chunks c    ON c.id = combined.chunk_id
     JOIN documents d ON d.id = c.document_id

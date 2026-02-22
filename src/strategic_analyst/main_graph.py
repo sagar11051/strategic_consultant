@@ -14,16 +14,14 @@ Graph flow:
     → save_report_node      (persist to Supabase)
     → END
 
-This is the ONLY graph compiled with checkpointer + store.
-Subgraphs are imported pre-compiled and inherit both at runtime.
+Module-level `graph` is compiled WITHOUT checkpointer/store so that
+`langgraph dev` can load it — the platform injects its own persistence.
 
-Exported `graph` at module level — what langgraph.json points to.
+For testing, use build_graph(store=InMemoryStore(), checkpointer=MemorySaver())
+to pass explicit instances.
 """
 
 from __future__ import annotations
-
-import os
-import uuid
 
 from dotenv import load_dotenv
 from langgraph.checkpoint.memory import MemorySaver
@@ -46,22 +44,8 @@ from strategic_analyst.subgraphs.report.report_graph import report_graph
 load_dotenv()
 
 
-def build_graph(store: BaseStore | None = None, checkpointer=None):
-    """
-    Build and compile the main graph.
-
-    Args:
-        store:        BaseStore instance. Defaults to InMemoryStore().
-        checkpointer: LangGraph checkpointer. Defaults to MemorySaver().
-
-    Returns:
-        CompiledStateGraph ready for invocation.
-    """
-    if store is None:
-        store = InMemoryStore()
-    if checkpointer is None:
-        checkpointer = MemorySaver()
-
+def _build_builder() -> StateGraph:
+    """Shared graph topology — nodes and edges only, no checkpointer/store."""
     builder = StateGraph(AgentState, input_schema=AgentInput)
 
     # ── Register nodes ────────────────────────────────────────────────────────
@@ -76,33 +60,41 @@ def build_graph(store: BaseStore | None = None, checkpointer=None):
     builder.add_node("save_report_node", save_report_node)
 
     # ── Static edges ──────────────────────────────────────────────────────────
-    # Context init → greeting → planning
     builder.add_edge(START, "context_loader")
     builder.add_edge("context_loader", "greeting_node")
     builder.add_edge("greeting_node", "planner_agent")
-
-    # planner_agent uses Command(goto="hitl_plan_gate") — no static edge needed
-
-    # hitl_plan_gate uses Command → research_subgraph | planner_agent | END
-
-    # After research finishes → discovery review
+    # planner_agent → hitl_plan_gate via Command
+    # hitl_plan_gate → research_subgraph | planner_agent | END via Command
     builder.add_edge("research_subgraph", "hitl_discovery_gate")
-
-    # hitl_discovery_gate uses Command → report_subgraph | research_subgraph | END
-
-    # After report draft finishes → final review
+    # hitl_discovery_gate → report_subgraph | research_subgraph | END via Command
     builder.add_edge("report_subgraph", "hitl_final_gate")
-
-    # hitl_final_gate uses Command →
-    #   save_report_node | report_subgraph | research_subgraph |
-    #   planner_agent | hitl_final_gate | END
-
-    # After save → done
+    # hitl_final_gate → save_report_node | report_subgraph | ... via Command
     builder.add_edge("save_report_node", END)
 
-    # ── Compile with checkpointer + store ─────────────────────────────────────
-    return builder.compile(checkpointer=checkpointer, store=store)
+    return builder
+
+
+def build_graph(store: BaseStore | None = None, checkpointer=None):
+    """
+    Build and compile the graph with explicit checkpointer + store.
+
+    Use this in tests:
+        g = build_graph(store=InMemoryStore(), checkpointer=MemorySaver())
+
+    Args:
+        store:        BaseStore instance (required for store-aware nodes).
+        checkpointer: LangGraph checkpointer (required for interrupt/resume).
+
+    Returns:
+        CompiledStateGraph with the provided persistence backends.
+    """
+    if store is None:
+        store = InMemoryStore()
+    if checkpointer is None:
+        checkpointer = MemorySaver()
+    return _build_builder().compile(checkpointer=checkpointer, store=store)
 
 
 # ── Module-level graph (what langgraph.json points to) ───────────────────────
-graph = build_graph()
+# Compiled WITHOUT checkpointer/store — langgraph dev injects its own.
+graph = _build_builder().compile()

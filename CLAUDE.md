@@ -154,13 +154,13 @@ Default to `hybrid_search`; use `semantic_search` only for broad conceptual quer
 
 ## Database Schema
 
-> All tables live in the Supabase project. The `chunks` and `documents` tables already exist.
-> Run the SQL blocks below in the **Supabase SQL editor** to create the missing tables and functions.
+> **Status (2026-02-23): all tables and RPC functions are live in Supabase.**
+> The SQL blocks below are the canonical reference — do not re-run them unless rebuilding from scratch.
 > The LangGraph checkpointer tables are created automatically — see section 4.
 
 ---
 
-### 1. Existing Tables (already in Supabase — do not recreate)
+### 1. Tables (all live in Supabase — do not recreate)
 
 #### `documents`
 Holds the parent document record for each ingested file.
@@ -197,12 +197,8 @@ Holds individual text chunks with embeddings for vector search.
 
 > **Not populated in this implementation:** `keywords`, `questions`, `summary` columns may exist in the table definition but are not written during ingestion and must not be referenced in queries or prompts.
 
----
-
-### 2. Tables to Create — Run in Supabase SQL Editor
-
 #### `reports`
-Stores completed, user-approved strategic reports.
+Stores completed, user-approved strategic reports. **Created 2026-02-23.**
 
 ```sql
 CREATE TABLE IF NOT EXISTS reports (
@@ -230,7 +226,7 @@ CREATE INDEX IF NOT EXISTS reports_topic_tags_idx ON reports USING GIN (topic_ta
 ```
 
 #### `report_chunks`
-Chunks of approved reports re-embedded for future RAG retrieval.
+Chunks of approved reports re-embedded for future RAG retrieval. **Created 2026-02-23.**
 Uses the **same embedding model and dimension** as `chunks` (BGE-M3, 1024 dims).
 
 ```sql
@@ -255,7 +251,7 @@ CREATE INDEX IF NOT EXISTS report_chunks_embedding_idx
 
 ---
 
-### 3. Required RPC Functions — Run in Supabase SQL Editor
+### 2. RPC Functions (live in Supabase — created 2026-02-23)
 
 #### `semantic_search` — pure vector similarity
 Called by `rag_tool.py::semantic_search`. Best for broad conceptual queries.
@@ -356,7 +352,7 @@ END;
 $$;
 ```
 
-#### `match_report_chunks` (past reports search)
+#### `match_report_chunks` — past reports search
 Called when agent retrieves from previously approved reports.
 
 ```sql
@@ -394,7 +390,7 @@ $$;
 
 ---
 
-### 4. LangGraph Prod Checkpointer Tables (DO NOT create manually)
+### 3. LangGraph Prod Checkpointer Tables (DO NOT create manually)
 
 These are created automatically when you call `PostgresSaver.setup()` or
 `AsyncPostgresSaver.setup()` using the `SUPABASE_DB_URL` connection string.
@@ -430,16 +426,21 @@ async with AsyncPostgresSaver.from_conn_string(os.getenv("SUPABASE_DB_URL")) as 
 
 ## Environment Variables
 
-See `.env.example` for the full list. Required at minimum:
+All secrets live in `.env`. Table names, function names, and model names are **hardcoded in source** — no env vars needed for them.
+
+Required variables:
 - `OVH_KEY` — single auth token for all OVH calls (LLM + embeddings)
 - `OVH_API_BASE_URL` — `https://oai.endpoints.kepler.ai.cloud.ovh.net/v1`
 - `OVH_EMBEDDING_ENDPOINT_URL` — `https://bge-m3.endpoints.kepler.ai.cloud.ovh.net/api/text2vec`
-- `MAIN_AGENT_MODEL` — `Mistral-Nemo-Instruct-2407`
-- `UTILITY_MODEL` — `Mistral-Nemo-Instruct-2407`
-- `LONG_CONTEXT_MODEL` — `gpt-oss-20b`
 - `SUPABASE_URL`, `SUPABASE_SERVICE_KEY`, `SUPABASE_DB_URL`
 - `TAVILY_API_KEY`
-- `LANGSMITH_API_KEY` (for tracing)
+- `LANGSMITH_API_KEY`, `LANGCHAIN_TRACING_V2`, `LANGCHAIN_PROJECT`
+
+Hardcoded in source (do not add env vars for these):
+- Primary / utility model: `Mistral-Nemo-Instruct-2407`
+- Long-context / writer model: `gpt-oss-20b`
+- Tables: `documents`, `chunks`, `reports`, `report_chunks`
+- RPC functions: `semantic_search`, `hybrid_search`, `match_report_chunks`
 
 ---
 

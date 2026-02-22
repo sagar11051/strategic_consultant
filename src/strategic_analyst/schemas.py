@@ -4,6 +4,16 @@ from typing import Annotated, Any, Literal, Optional
 from typing_extensions import TypedDict
 from pydantic import BaseModel, Field
 from langgraph.graph import MessagesState
+from langgraph.graph.message import add_messages
+
+
+# ── Reducers ──────────────────────────────────────────────────────────────────
+
+def merge_dicts(a: dict, b: dict) -> dict:
+    """Reducer: shallow-merge two dicts (b wins on key conflicts).
+    Used for research_findings and report_sections so parallel Send() workers
+    can each write their own key without overwriting each other."""
+    return {**a, **b}
 
 
 # ── Main Agent State ──────────────────────────────────────────────────────────
@@ -39,11 +49,15 @@ class AgentState(MessagesState):
 
     # ── Research ───────────────────────────────────────────────────────────────
     research_tasks: list[dict]                      # [{task_id, question, context}]
-    research_findings: dict                         # {task_id: {answer, sources, confidence}}
+    # Annotated with merge_dicts so parallel Send() task agents each write their
+    # own key without overwriting other agents' findings.
+    research_findings: Annotated[dict, merge_dicts]  # {task_id: {answer, sources, confidence}}
     supervisor_summary: str                         # supervisor's synthesis of all findings
 
     # ── Report Writing ─────────────────────────────────────────────────────────
-    report_sections: dict                           # {section_name: content}
+    # Annotated with merge_dicts so parallel Send() writer agents each write
+    # their own section_id key without overwriting other sections.
+    report_sections: Annotated[dict, merge_dicts]   # {section_id: {title, content, instructions}}
     report_draft: str                               # assembled full draft
     final_report: str                               # approved final version
     report_format: Literal["markdown", "json", "pdf"]
@@ -68,6 +82,35 @@ class AgentInput(TypedDict):
     user_name: Optional[str]
     user_role: Optional[str]
     company_name: Optional[str]
+
+
+# ── Sub-agent State (used as Send() payload — not graph state) ─────────────────
+
+class TaskAgentState(TypedDict):
+    """State passed to each research task agent via Send()."""
+    task_id: str
+    question: str
+    data_sources: list          # ["company_db", "web"]
+    context: str                # relevant context snippet for this task
+    retry_count: int
+    supervisor_critique: str    # empty on first attempt; supervisor feedback on retry
+    user_id: str
+    messages: Annotated[list, add_messages]
+
+
+class WriterAgentState(TypedDict):
+    """State passed to each report writer agent via Send()."""
+    section_id: str
+    section_title: str
+    section_instructions: str   # what this section must cover
+    research_findings: dict     # full findings for reference
+    supervisor_summary: str
+    user_preferences: str       # from memory
+    user_profile: str           # from memory
+    retry_count: int
+    supervisor_critique: str
+    user_id: str
+    messages: Annotated[list, add_messages]
 
 
 # ── Structured Output — Research Plan ─────────────────────────────────────────
@@ -174,9 +217,29 @@ class ReportMetadata(BaseModel):
     frameworks_used: list[str]
 
 
+# ── Report Section Plan (used internally by report supervisor) ────────────────
+
+class ReportSection(BaseModel):
+    section_id: str
+    title: str
+    instructions: str = Field(description="What this section must cover, what data to use, tone")
+    word_count_target: int = Field(default=400)
+
+
+class ReportStructure(BaseModel):
+    """Planned structure of the report."""
+    sections: list[ReportSection]
+    formatting_notes: str = Field(
+        description="Global formatting instructions based on user preferences"
+    )
+
+
 __all__ = [
+    "merge_dicts",
     "AgentState",
     "AgentInput",
+    "TaskAgentState",
+    "WriterAgentState",
     "ResearchTask",
     "ResearchPlan",
     "ResearchFinding",
@@ -185,4 +248,6 @@ __all__ = [
     "SessionRouter",
     "MemoryUpdate",
     "ReportMetadata",
+    "ReportSection",
+    "ReportStructure",
 ]

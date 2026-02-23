@@ -44,7 +44,9 @@ async def context_loader(
     Returns a full state init dict.
     """
     cfg = AgentConfiguration.from_runnable_config(config)
-    user_id = cfg.user_id
+    # Fallback chain: configurable > AgentInput state field > hardcoded default.
+    # Studio may pass user_id="" when the field is left blank — treat that as unset.
+    user_id = cfg.user_id or state.get("user_id") or "default_user"
     session_id = cfg.session_id or str(uuid.uuid4())
     query = state.get("query", "")
 
